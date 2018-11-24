@@ -31,6 +31,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.spark.SparkEnv;
 import org.apache.spark.executor.ShuffleWriteMetrics;
 import org.apache.spark.memory.MemoryConsumer;
+import org.apache.spark.memory.SparkOutOfMemoryError;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.storage.BlockManager;
@@ -160,15 +161,13 @@ public final class BytesToBytesMap extends MemoryConsumer {
 
   private final boolean enablePerfMetrics;
 
-  private long timeSpentResizingNs = 0;
-
   private long numProbes = 0;
 
   private long numKeyLookups = 0;
 
-  private long numHashCollisions = 0;
-
   private long peakMemoryUsedBytes = 0L;
+
+  private final int initialCapacity;
 
   private final BlockManager blockManager;
   private final SerializerManager serializerManager;
@@ -202,6 +201,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
       throw new IllegalArgumentException("Page size " + pageSizeBytes + " cannot exceed " +
         TaskMemoryManager.MAXIMUM_PAGE_SIZE_BYTES);
     }
+    this.initialCapacity = initialCapacity;
     allocate(initialCapacity);
   }
 
@@ -259,6 +259,11 @@ public final class BytesToBytesMap extends MemoryConsumer {
       this.destructive = destructive;
       if (destructive) {
         destructiveIterator = this;
+        // longArray will not be used anymore if destructive is true, release it now.
+        if (longArray != null) {
+          freeArray(longArray);
+          longArray = null;
+        }
       }
     }
 
@@ -279,13 +284,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
         } else {
           currentPage = null;
           if (reader != null) {
-            // remove the spill file from disk
-            File file = spillWriters.removeFirst().getFile();
-            if (file != null && file.exists()) {
-              if (!file.delete()) {
-                logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
-              }
-            }
+            handleFailedDelete();
           }
           try {
             Closeables.close(reader, /* swallowIOException = */ false);
@@ -303,13 +302,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
     public boolean hasNext() {
       if (numRecords == 0) {
         if (reader != null) {
-          // remove the spill file from disk
-          File file = spillWriters.removeFirst().getFile();
-          if (file != null && file.exists()) {
-            if (!file.delete()) {
-              logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
-            }
-          }
+          handleFailedDelete();
         }
       }
       return numRecords > 0;
@@ -355,6 +348,8 @@ public final class BytesToBytesMap extends MemoryConsumer {
           return 0L;
         }
 
+        updatePeakMemoryUsed();
+
         // TODO: use existing ShuffleWriteMetrics
         ShuffleWriteMetrics writeMetrics = new ShuffleWriteMetrics();
 
@@ -399,6 +394,14 @@ public final class BytesToBytesMap extends MemoryConsumer {
     public void remove() {
       throw new UnsupportedOperationException();
     }
+
+    private void handleFailedDelete() {
+      // remove the spill file from disk
+      File file = spillWriters.removeFirst().getFile();
+      if (file != null && file.exists() && !file.delete()) {
+        logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
+      }
+    }
   }
 
   /**
@@ -424,6 +427,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
    * `lookup()`, the behavior of the returned iterator is undefined.
    */
   public MapIterator destructiveIterator() {
+    updatePeakMemoryUsed();
     return new MapIterator(numValues, loc, true);
   }
 
@@ -486,10 +490,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
             );
             if (areEqual) {
               return;
-            } else {
-              if (enablePerfMetrics) {
-                numHashCollisions++;
-              }
             }
           }
         }
@@ -663,7 +663,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
      * It is only valid to call this method immediately after calling `lookup()` using the same key.
      * </p>
      * <p>
-     * The key and value must be word-aligned (that is, their sizes must multiples of 8).
+     * The key and value must be word-aligned (that is, their sizes must be a multiple of 8).
      * </p>
      * <p>
      * After calling this method, calls to `get[Key|Value]Address()` and `get[Key|Value]Length`
@@ -695,7 +695,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
       if (numKeys == MAX_CAPACITY
         // The map could be reused from last spill (because of no enough memory to grow),
         // then we don't try to grow again if hit the `growthThreshold`.
-        || !canGrowArray && numKeys > growthThreshold) {
+        || !canGrowArray && numKeys >= growthThreshold) {
         return false;
       }
 
@@ -704,7 +704,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
       // must be stored in the same memory page.
       // (8 byte key length) (key) (value) (8 byte pointer to next value)
       int uaoSize = UnsafeAlignedOffset.getUaoSize();
-      final long recordLength = (2 * uaoSize) + klen + vlen + 8;
+      final long recordLength = (2L * uaoSize) + klen + vlen + 8;
       if (currentPage == null || currentPage.size() - pageCursor < recordLength) {
         if (!acquireNewPage(recordLength + uaoSize)) {
           return false;
@@ -739,10 +739,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
         longArray.set(pos * 2 + 1, keyHashcode);
         isDefined = true;
 
-        if (numKeys > growthThreshold && longArray.size() < MAX_CAPACITY) {
+        if (numKeys >= growthThreshold && longArray.size() < MAX_CAPACITY) {
           try {
             growAndRehash();
-          } catch (OutOfMemoryError oom) {
+          } catch (SparkOutOfMemoryError oom) {
             canGrowArray = false;
           }
         }
@@ -758,7 +758,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
   private boolean acquireNewPage(long required) {
     try {
       currentPage = allocatePage(required);
-    } catch (OutOfMemoryError e) {
+    } catch (SparkOutOfMemoryError e) {
       return false;
     }
     dataPages.add(currentPage);
@@ -857,16 +857,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
   }
 
   /**
-   * Returns the total amount of time spent resizing this map (in nanoseconds).
-   */
-  public long getTimeSpentResizingNs() {
-    if (!enablePerfMetrics) {
-      throw new IllegalStateException();
-    }
-    return timeSpentResizingNs;
-  }
-
-  /**
    * Returns the average number of probes per key lookup.
    */
   public double getAverageProbesPerLookup() {
@@ -874,13 +864,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
       throw new IllegalStateException();
     }
     return (1.0 * numProbes) / numKeyLookups;
-  }
-
-  public long getNumHashCollisions() {
-    if (!enablePerfMetrics) {
-      throw new IllegalStateException();
-    }
-    return numHashCollisions;
   }
 
   @VisibleForTesting
@@ -900,14 +883,16 @@ public final class BytesToBytesMap extends MemoryConsumer {
    * Reset this map to initialized state.
    */
   public void reset() {
+    updatePeakMemoryUsed();
     numKeys = 0;
     numValues = 0;
-    longArray.zeroOut();
-
+    freeArray(longArray);
     while (dataPages.size() > 0) {
       MemoryBlock dataPage = dataPages.removeLast();
       freePage(dataPage);
     }
+    allocate(initialCapacity);
+    canGrowArray = true;
     currentPage = null;
     pageCursor = 0;
   }
@@ -919,10 +904,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
   void growAndRehash() {
     assert(longArray != null);
 
-    long resizeStartTime = -1;
-    if (enablePerfMetrics) {
-      resizeStartTime = System.nanoTime();
-    }
     // Store references to the old data structures to be used when we re-hash
     final LongArray oldLongArray = longArray;
     final int oldCapacity = (int) oldLongArray.size() / 2;
@@ -947,9 +928,5 @@ public final class BytesToBytesMap extends MemoryConsumer {
       longArray.set(newPos * 2 + 1, hashcode);
     }
     freeArray(oldLongArray);
-
-    if (enablePerfMetrics) {
-      timeSpentResizingNs += System.nanoTime() - resizeStartTime;
-    }
   }
 }

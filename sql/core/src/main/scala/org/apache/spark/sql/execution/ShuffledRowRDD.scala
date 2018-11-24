@@ -33,10 +33,6 @@ private final class ShuffledRowRDDPartition(
     val startPreShufflePartitionIndex: Int,
     val endPreShufflePartitionIndex: Int) extends Partition {
   override val index: Int = postShufflePartitionIndex
-
-  override def hashCode(): Int = postShufflePartitionIndex
-
-  override def equals(other: Any): Boolean = super.equals(other)
 }
 
 /**
@@ -158,6 +154,7 @@ class ShuffledRowRDD(
 
   override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
     val shuffledRowPartition = split.asInstanceOf[ShuffledRowRDDPartition]
+    val metrics = context.taskMetrics().createTempShuffleReadMetrics()
     // The range of pre-shuffle partitions that we are fetching at here is
     // [startPreShufflePartitionIndex, endPreShufflePartitionIndex - 1].
     val reader =
@@ -165,7 +162,8 @@ class ShuffledRowRDD(
         dependency.shuffleHandle,
         shuffledRowPartition.startPreShufflePartitionIndex,
         shuffledRowPartition.endPreShufflePartitionIndex,
-        context)
+        context,
+        metrics)
     reader.read().asInstanceOf[Iterator[Product2[Int, InternalRow]]].map(_._2)
   }
 

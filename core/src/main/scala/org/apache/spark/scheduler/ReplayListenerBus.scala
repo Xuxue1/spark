@@ -17,11 +17,12 @@
 
 package org.apache.spark.scheduler
 
-import java.io.{InputStream, IOException}
+import java.io.{EOFException, InputStream, IOException}
 
 import scala.io.Source
 
 import com.fasterxml.jackson.core.JsonParseException
+import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.internal.Logging
@@ -53,13 +54,26 @@ private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
       sourceName: String,
       maybeTruncated: Boolean = false,
       eventsFilter: ReplayEventsFilter = SELECT_ALL_FILTER): Unit = {
+    val lines = Source.fromInputStream(logData).getLines()
+    replay(lines, sourceName, maybeTruncated, eventsFilter)
+  }
 
+  /**
+   * Overloaded variant of [[replay()]] which accepts an iterator of lines instead of an
+   * [[InputStream]]. Exposed for use by custom ApplicationHistoryProvider implementations.
+   */
+  def replay(
+      lines: Iterator[String],
+      sourceName: String,
+      maybeTruncated: Boolean,
+      eventsFilter: ReplayEventsFilter): Unit = {
     var currentLine: String = null
     var lineNumber: Int = 0
+    val unrecognizedEvents = new scala.collection.mutable.HashSet[String]
+    val unrecognizedProperties = new scala.collection.mutable.HashSet[String]
 
     try {
-      val lineEntries = Source.fromInputStream(logData)
-        .getLines()
+      val lineEntries = lines
         .zipWithIndex
         .filter { case (line, _) => eventsFilter(line) }
 
@@ -72,6 +86,22 @@ private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
 
           postToAll(JsonProtocol.sparkEventFromJson(parse(currentLine)))
         } catch {
+          case e: ClassNotFoundException =>
+            // Ignore unknown events, parse through the event log file.
+            // To avoid spamming, warnings are only displayed once for each unknown event.
+            if (!unrecognizedEvents.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized event: ${e.getMessage}")
+              unrecognizedEvents.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
+          case e: UnrecognizedPropertyException =>
+            // Ignore unrecognized properties, parse through the event log file.
+            // To avoid spamming, warnings are only displayed once for each unrecognized property.
+            if (!unrecognizedProperties.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized property: ${e.getMessage}")
+              unrecognizedProperties.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
           case jpe: JsonParseException =>
             // We can only ignore exception from last line of the file that might be truncated
             // the last entry may not be the very last line in the event log, but we treat it
@@ -85,6 +115,11 @@ private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
         }
       }
     } catch {
+      case e: HaltReplayException =>
+        // Just stop replay.
+      case _: EOFException if maybeTruncated =>
+      case _: IOException if maybeTruncated =>
+        logWarning(s"Failed to read Spark event log: $sourceName")
       case ioe: IOException =>
         throw ioe
       case e: Exception =>
@@ -93,8 +128,17 @@ private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
     }
   }
 
+  override protected def isIgnorableException(e: Throwable): Boolean = {
+    e.isInstanceOf[HaltReplayException]
+  }
+
 }
 
+/**
+ * Exception that can be thrown by listeners to halt replay. This is handled by ReplayListenerBus
+ * only, and will cause errors if thrown when using other bus implementations.
+ */
+private[spark] class HaltReplayException extends RuntimeException
 
 private[spark] object ReplayListenerBus {
 
